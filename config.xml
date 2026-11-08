@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<module>
+    <name>obsstocks</name>
+    <displayName><![CDATA[Actualizador masivo de stock vía CSV con avisos]]></displayName>
+    <version><![CDATA[2.0.1]]></version>
+    <description><![CDATA[Actualiza el stock de los productos y los avisos de stock mínimo subiendo un CSV, y envía por email los productos bajo mínimos.]]></description>
+    <author><![CDATA[OBSolutions.es]]></author>
+    <tab><![CDATA[migration_tools]]></tab>
+    <confirmUninstall><![CDATA[¿Seguro que quieres desinstalar el módulo? Los avisos configurados se conservan en la base de datos.]]></confirmUninstall>
+    <is_configurable>1</is_configurable>
+    <need_instance>0</need_instance>
+    <limited_countries></limited_countries>
+</module>
