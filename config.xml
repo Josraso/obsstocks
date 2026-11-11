@@ -2,7 +2,7 @@
 <module>
     <name>obsstocks</name>
     <displayName><![CDATA[Actualizador masivo de stock vía CSV con avisos]]></displayName>
-    <version><![CDATA[2.1.0]]></version>
+    <version><![CDATA[2.1.1]]></version>
     <description><![CDATA[Actualiza el stock de los productos y los avisos de stock mínimo subiendo un CSV, y envía por email los productos bajo mínimos.]]></description>
     <author><![CDATA[OBSolutions.es]]></author>
     <tab><![CDATA[migration_tools]]></tab>

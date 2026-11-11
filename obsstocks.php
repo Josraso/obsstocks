@@ -20,7 +20,7 @@ class obsstocks extends Module
     {
         $this->name = 'obsstocks';
         $this->tab = 'migration_tools';
-        $this->version = '2.1.0';
+        $this->version = '2.1.1';
         $this->author = 'OBSolutions.es';
         $this->need_instance = 0;
         $this->bootstrap = true;
@@ -49,7 +49,7 @@ class obsstocks extends Module
         $this->getUpdater()->notifyUninstall();
 
         // Los avisos (tabla obsstocks_minstocks) se conservan para no perderlos al reinstalar
-        foreach (['OBSSTOCKS_CRON_TOKEN', 'OBSSTOCKS_ALERT_EMAIL', 'OBSSTOCKS_UPD_TS', 'OBSSTOCKS_UPD_INFO'] as $k) {
+        foreach (['OBSSTOCKS_CRON_TOKEN', 'OBSSTOCKS_ALERT_EMAIL', 'OBSSTOCKS_UPD_TS', 'OBSSTOCKS_UPD_INFO', 'OBSSTOCKS_UPD_SU', 'OBSSTOCKS_UPD_LT'] as $k) {
             Configuration::deleteByName($k);
         }
         self::removeLegacyTab();

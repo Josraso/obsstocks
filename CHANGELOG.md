@@ -1,5 +1,9 @@
 # Changelog - obsstocks
 
+## 2.1.1 - 2026-11-11
+- Actualizador: si el servidor de actualizaciones cambia de dominio, el módulo aprende la dirección nueva solo.
+- Actualizador preparado para licencias (desactivadas en este módulo).
+
 ## 2.1.0 - 2026-11-11
 - Pestaña «Avisos»: buscador instantáneo por referencia o nombre sobre todos los productos y combinaciones, con el
   stock mínimo y la cantidad a pedir editables en la misma fila (se guardan solos). Filtros «Con aviso», «Bajo

@@ -43,6 +43,9 @@ class ObsstocksUpdater
     /** Clave de este módulo en el servidor de actualizaciones: solo vale para él (ficha del módulo en el panel) */
     const API_KEY = '9e041f6403d57818125e48ad9c2d2e69f3a813c6';
 
+    /** 0 = normal · 1 = requiere alta en el servidor para esta tienda */
+    const CHANNEL = 0;
+
     /** Segundos entre avisos automáticos (6 horas) */
     const CHECK_EVERY = 21600;
 
@@ -108,6 +111,9 @@ class ObsstocksUpdater
     public function getNativeModuleList()
     {
         if (!$this->isConfigured()) {
+            return array();
+        }
+        if (!$this->fresh()) {
             return array();
         }
 
@@ -185,7 +191,7 @@ class ObsstocksUpdater
             return 'El servidor de actualizaciones no está configurado en este módulo.';
         }
 
-        $response = $this->httpPost(rtrim(self::SERVER_URL, '/') . '/api.php?action=check', array(
+        $response = $this->httpPost(rtrim($this->base(), '/') . '/api.php?action=check', array(
             'key' => self::API_KEY,
             'module' => $this->module->name,
             'version' => $this->module->version,
@@ -214,6 +220,26 @@ class ObsstocksUpdater
         );
         // En base64 para que Configuration no toque el contenido
         Configuration::updateGlobalValue($this->key . '_INFO', base64_encode(json_encode($info)));
+
+        // El servidor puede indicar que se ha mudado de dominio
+        if (!empty($response['server_url']) && preg_match('#^https?://#', (string) $response['server_url'])) {
+            $learned = rtrim((string) $response['server_url'], '/') . '/';
+            if ($learned !== (string) Configuration::getGlobalValue($this->key . '_SU')) {
+                Configuration::updateGlobalValue($this->key . '_SU', $learned);
+            }
+        }
+        // Alta de la tienda (solo si el módulo la necesita)
+        if (isset($response['license']) && is_array($response['license'])) {
+            if (!empty($response['license']['ok']) && !empty($response['license']['token'])) {
+                Configuration::updateGlobalValue($this->key . '_LT', base64_encode(json_encode(array(
+                    't' => (string) $response['license']['token'],
+                    'e' => isset($response['license']['expires']) ? (int) $response['license']['expires'] : 0,
+                    's' => $this->site(),
+                ))));
+            } elseif (empty($response['license']['ok'])) {
+                Configuration::updateGlobalValue($this->key . '_LT', '');
+            }
+        }
 
         return $info;
     }
@@ -271,7 +297,7 @@ class ObsstocksUpdater
         }
 
         try {
-            $this->httpPost(rtrim(self::SERVER_URL, '/') . '/api.php?action=' . $action, array_merge(array(
+            $this->httpPost(rtrim($this->base(), '/') . '/api.php?action=' . $action, array_merge(array(
                 'key' => self::API_KEY,
                 'module' => $this->module->name,
                 'site' => $this->site(),
@@ -289,6 +315,131 @@ class ObsstocksUpdater
     }
 
     /* ------------------------------------------------------------------ */
+    /* Servidor con el que se habla y alta de la tienda                    */
+    /* ------------------------------------------------------------------ */
+
+    /** URL del servidor; si en un aviso indicó otra (se mudó de dominio), esa */
+    protected function base()
+    {
+        $learned = (string) Configuration::getGlobalValue($this->key . '_SU');
+        if ($learned !== '' && preg_match('#^https?://#', $learned)) {
+            return $learned;
+        }
+
+        return self::SERVER_URL;
+    }
+
+    /** Tiendas de desarrollo o pruebas: no necesitan alta */
+    protected function localHost()
+    {
+        $host = Tools::strtolower(preg_replace('#[:/].*$#', '', Tools::getShopDomainSsl(false)));
+
+        return $host === 'localhost' || $host === '127.0.0.1' || $host === '::1'
+            || Tools::substr($host, -5) === '.test' || Tools::substr($host, -10) === '.localhost'
+            || strpos($host, 'staging') !== false || strpos($host, 'dev.') === 0;
+    }
+
+    protected function grant()
+    {
+        $raw = (string) Configuration::getGlobalValue($this->key . '_LT');
+        $data = $raw !== '' ? json_decode(base64_decode($raw), true) : null;
+
+        return is_array($data) ? $data : array();
+    }
+
+    /** Sello que debe traer el alta de esta tienda (se comprueba sin servidor) */
+    protected function seal($site, $exp)
+    {
+        return Tools::substr(hash_hmac('sha256', 'josra-licencia|' . Tools::strtolower($this->module->name) . '|' . $site . '|' . (int) $exp, self::API_KEY), 0, 48);
+    }
+
+    /** ¿Está el módulo habilitado para esta tienda? */
+    public function ready()
+    {
+        if (self::CHANNEL == 0 || $this->localHost()) {
+            return true;
+        }
+        $g = $this->grant();
+        if (empty($g['t']) || !isset($g['e'])) {
+            return false;
+        }
+
+        return hash_equals($this->seal($this->site(), (int) $g['e']), (string) $g['t']);
+    }
+
+    /** ¿Puede recibir versiones nuevas? (un alta con fecha deja de darlas al vencer) */
+    public function fresh()
+    {
+        if (!$this->ready()) {
+            return false;
+        }
+        if (self::CHANNEL == 0 || $this->localHost()) {
+            return true;
+        }
+        $g = $this->grant();
+        $e = isset($g['e']) ? (int) $g['e'] : 0;
+
+        return $e === 0 || time() < $e;
+    }
+
+    /**
+     * Para enable() del módulo: si la tienda aún no tiene su alta guardada, la pide
+     * al servidor en ese momento.
+     */
+    public function canEnable()
+    {
+        if (!$this->ready()) {
+            $this->check(5);
+        }
+
+        return $this->ready();
+    }
+
+    /** Texto para el error de PrestaShop cuando se intenta activar sin alta */
+    public function noticeText()
+    {
+        return sprintf(
+            '%s necesita licencia para esta tienda (%s). Pide la licencia a Josra indicando este dominio y, cuando te confirme que ya la tienes, vuelve a pulsar «Activar».',
+            $this->module->displayName,
+            rtrim($this->site(), '/')
+        );
+    }
+
+    /**
+     * Cartel grande para la configuración del módulo: sin alta, o con alta pero desactivado.
+     * Lleva un botón que comprueba el alta y activa el módulo ahí mismo. Vacío si todo está bien.
+     */
+    public function renderNotice()
+    {
+        if (self::CHANNEL == 0) {
+            return '';
+        }
+        $ready = $this->ready();
+        if ($ready && $this->module->active) {
+            return '';
+        }
+        $name = Tools::safeOutput($this->module->displayName);
+        if ($ready) {
+            $title = $name . ' está desactivado';
+            $text = 'La licencia de esta tienda está bien, pero el módulo está desactivado. Pulsa el botón para activarlo.';
+            $button = 'Activar el módulo';
+        } else {
+            $title = $name . ' necesita licencia para esta tienda';
+            $text = 'Esta tienda (<strong>' . Tools::safeOutput(rtrim($this->site(), '/')) . '</strong>) no tiene licencia de este módulo, así que está desactivado y no hace nada. '
+                . 'Pide la licencia a Josra indicando este dominio.</p>'
+                . '<p>Cuando te confirme que ya la tienes, <strong>vuelve aquí y pulsa el botón</strong>: el módulo comprobará la licencia y se activará solo.';
+            $button = 'Ya tengo la licencia: activar el módulo';
+        }
+
+        return '<form method="post" action="' . Tools::safeOutput($this->configUrl()) . '">'
+            . '<div class="alert alert-danger" style="font-size:15px;line-height:1.5;padding:18px 22px">'
+            . '<h4 style="font-size:19px;margin:0 0 10px">' . $title . '</h4>'
+            . '<p>' . $text . '</p>'
+            . '<p style="margin:16px 0 0"><button type="submit" name="josraupd_on" value="1" class="btn btn-primary btn-lg"><i class="icon-unlock"></i> ' . $button . '</button></p>'
+            . '</div></form>';
+    }
+
+    /* ------------------------------------------------------------------ */
     /* Configuración del módulo: acciones y panel                          */
     /* ------------------------------------------------------------------ */
 
@@ -301,6 +452,17 @@ class ObsstocksUpdater
 
         // Autorreparación: hooks del actualizador (por si el módulo se subió por FTP)
         $this->registerHooks();
+
+        // Botón del cartel: comprobar el alta y activar el módulo
+        if (Tools::isSubmit('josraupd_on')) {
+            if ($this->canEnable() && ($this->module->active || $this->module->enable())) {
+                $this->module->active = 1;
+                $html .= $this->module->displayConfirmation('Licencia comprobada: el módulo ya está activado.');
+            } else {
+                $html .= $this->module->displayError('Todavía no consta la licencia para ' . rtrim($this->site(), '/') . '. Si te acaban de confirmar que la tienes, espera un minuto y vuelve a pulsar el botón.');
+            }
+        }
+        $html .= $this->renderNotice();
 
         if (Tools::getValue('josraupd_done')) {
             $html .= $this->module->displayConfirmation(sprintf('Módulo actualizado a la versión %s.', $this->module->version));
@@ -414,6 +576,9 @@ class ObsstocksUpdater
     {
         if (!class_exists('ZipArchive')) {
             return 'No se puede actualizar: falta la extensión zip de PHP en este servidor.';
+        }
+        if (!$this->fresh()) {
+            return 'Este módulo no puede actualizarse ahora.';
         }
 
         // Enlace de descarga recién firmado
