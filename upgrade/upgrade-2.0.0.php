@@ -18,7 +18,7 @@ function upgrade_module_2_0_0($module)
             @unlink($dir . $f);
         }
     }
-    foreach (['backward_compatibility', 'export', 'docs', 'views'] as $d) {
+    foreach (['backward_compatibility', 'export', 'docs', 'views/templates'] as $d) {
         if (is_dir($dir . $d)) {
             Tools::deleteDirectory($dir . $d);
         }

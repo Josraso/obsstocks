@@ -8,6 +8,11 @@
  *  - separador ; , o tabulador, archivos guardados por Excel (con BOM o en Windows-1252),
  *  - referencias en formato ="REF".
  * Siempre devuelve un informe de lo que ha hecho (o haría, en modo comprobación).
+ *
+ * Avisos, dos modos:
+ *  - mantener (por defecto): solo se tocan las referencias que vienen en el archivo;
+ *  - sustituir: además se borran los avisos de las referencias que no vienen en el archivo
+ *    (antes se guarda una copia de todos los avisos).
  */
 if (!defined('_PS_VERSION_')) {
     exit;
@@ -31,12 +36,14 @@ class ObsStocksImporter
     public $update_alerts = true;
     public $add_stock = false;
     public $dry = true;
+    public $replace_alerts = false;
 
     /** @var array informe */
     public $report;
 
-    public function __construct($update_stock, $update_alerts, $add_stock, $dry)
+    public function __construct($update_stock, $update_alerts, $add_stock, $dry, $replace_alerts = false)
     {
+        $this->replace_alerts = (bool) $replace_alerts;
         $this->update_stock = (bool) $update_stock;
         $this->update_alerts = (bool) $update_alerts;
         $this->add_stock = (bool) $add_stock;
@@ -175,6 +182,7 @@ class ObsStocksImporter
             'delimiter' => $data['delimiter'],
             'rows' => 0,
             'stock_changed' => 0, 'alert_changed' => 0, 'unchanged' => 0, 'not_found' => 0, 'invalid' => 0,
+            'alert_deleted' => 0, 'replace' => false, 'backup' => '',
             'lines' => [],
         ];
         if ($data['error']) {
@@ -189,6 +197,10 @@ class ObsStocksImporter
         $doMin = $this->update_alerts && isset($map['min']);
         $doQty = $this->update_alerts && isset($map['qty']);
         $line = 1;
+        // Modo sustituir: solo si el archivo trae avisos y está activado «Actualizar avisos»
+        $replace = $this->replace_alerts && ($doMin || $doQty);
+        $this->report['replace'] = $replace;
+        $seen = [];
 
         foreach ($data['rows'] as $row) {
             ++$line;
@@ -199,6 +211,18 @@ class ObsStocksImporter
             $ref = self::clean($get('reference'));
             $msg = [];
             $status = 'unchanged';
+            if ($replace) {
+                if ($ref === '' && $useIds) {
+                    // Fila identificada solo por ID: se busca su referencia para no borrarle el aviso
+                    $byId = $this->findTarget(Tools::strtolower(self::clean($get('type'))), (int) self::clean($get('id')), '', $e0);
+                    if ($byId) {
+                        $ref = $byId['reference'];
+                    }
+                }
+                if ($ref !== '') {
+                    $seen[$ref] = true;
+                }
+            }
 
             $okS = $okM = $okQ = true;
             $stock = $doStock ? self::num($get('stock'), $okS) : null;
@@ -286,6 +310,25 @@ class ObsStocksImporter
                 $status = 'partial';
             }
             $this->addLine($line, $ref, $status, implode(' · ', $msg), false);
+        }
+
+        /* --- modo sustituir: fuera los avisos de las referencias que no vienen en el archivo --- */
+        if ($replace && $seen) {
+            $gone = array_diff_key($alerts, $seen);
+            if ($gone) {
+                if (!$this->dry) {
+                    $this->report['backup'] = Mystocks::backupAlerts();
+                    foreach (array_chunk(array_keys($gone), 200) as $chunk) {
+                        Db::getInstance()->execute(
+                            'DELETE FROM `' . _DB_PREFIX_ . Mystocks::TABLE . '` WHERE `reference` IN (\'' . implode('\', \'', array_map('pSQL', array_map('strval', $chunk))) . '\')'
+                        );
+                    }
+                }
+                foreach ($gone as $ref => $a) {
+                    $this->addLine(0, (string) $ref, 'deleted', 'No viene en el archivo (tenía mínimo ' . (int) $a['min_stock'] . ', a pedir ' . (int) $a['qty'] . ').', false);
+                }
+                $this->report['alert_deleted'] = count($gone);
+            }
         }
 
         return $this->report;

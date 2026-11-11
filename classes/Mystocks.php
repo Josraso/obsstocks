@@ -113,6 +113,68 @@ class Mystocks
         return $out;
     }
 
+    /** Guarda (crea o cambia) el aviso de una referencia */
+    public static function saveAlert($reference, $min, $qty)
+    {
+        return (bool) Db::getInstance()->execute(
+            'INSERT INTO `' . _DB_PREFIX_ . self::TABLE . '` (`reference`, `min_stock`, `qty`)
+            VALUES (\'' . pSQL($reference) . '\', ' . (int) $min . ', ' . (int) $qty . ')
+            ON DUPLICATE KEY UPDATE `min_stock` = ' . (int) $min . ', `qty` = ' . (int) $qty
+        );
+    }
+
+    /** Quita el aviso de una referencia */
+    public static function deleteAlert($reference)
+    {
+        return (bool) Db::getInstance()->execute(
+            'DELETE FROM `' . _DB_PREFIX_ . self::TABLE . '` WHERE `reference` = \'' . pSQL($reference) . '\''
+        );
+    }
+
+    /** Carpeta de las copias de avisos (protegida por el .htaccess de logs/) */
+    public static function backupDir()
+    {
+        return dirname(dirname(__FILE__)) . '/logs/';
+    }
+
+    /**
+     * Copia de todos los avisos en un CSV que se puede volver a subir tal cual
+     * (REFERENCE;MIN STOCK;QTY). Se conservan las 15 últimas.
+     *
+     * @return string nombre del archivo, o '' si no se pudo guardar
+     */
+    public static function backupAlerts()
+    {
+        $rows = [['REFERENCE', 'MIN STOCK', 'QTY']];
+        foreach (self::alerts() as $ref => $a) {
+            $rows[] = [self::xref($ref), (int) $a['min_stock'], (int) $a['qty']];
+        }
+        $name = 'avisos-' . date('Ymd-His') . '.csv';
+        if (@file_put_contents(self::backupDir() . $name, self::toCsv($rows)) === false) {
+            return '';
+        }
+        $all = self::backups();
+        foreach (array_slice($all, 15) as $old) {
+            @unlink(self::backupDir() . $old);
+        }
+
+        return $name;
+    }
+
+    /** Copias guardadas, de la más reciente a la más antigua */
+    public static function backups()
+    {
+        $out = [];
+        foreach ((array) glob(self::backupDir() . 'avisos-*.csv') as $f) {
+            if ($f && preg_match('/^avisos-[0-9]{8}-[0-9]{6}\.csv$/', basename($f))) {
+                $out[] = basename($f);
+            }
+        }
+        rsort($out);
+
+        return $out;
+    }
+
     /**
      * Catálogo: combinaciones y productos sin combinaciones, con nombre y stock.
      *

@@ -12,6 +12,7 @@ if (!defined('_PS_VERSION_')) {
 
 require_once dirname(__FILE__) . '/classes/Mystocks.php';
 require_once dirname(__FILE__) . '/classes/ObsStocksImporter.php';
+require_once dirname(__FILE__) . '/classes/ObsstocksUpdater.php';
 
 class obsstocks extends Module
 {
@@ -19,7 +20,7 @@ class obsstocks extends Module
     {
         $this->name = 'obsstocks';
         $this->tab = 'migration_tools';
-        $this->version = '2.0.1';
+        $this->version = '2.1.0';
         $this->author = 'OBSolutions.es';
         $this->need_instance = 0;
         $this->bootstrap = true;
@@ -38,13 +39,17 @@ class obsstocks extends Module
 
     public function install()
     {
-        return parent::install() && self::installDb() && self::removeLegacyTab() && $this->installConfig();
+        return parent::install() && self::installDb() && self::removeLegacyTab() && $this->installConfig()
+            && $this->getUpdater()->registerHooks();
     }
 
     public function uninstall()
     {
+        // Aviso al servidor de actualizaciones (no impide desinstalar si no responde)
+        $this->getUpdater()->notifyUninstall();
+
         // Los avisos (tabla obsstocks_minstocks) se conservan para no perderlos al reinstalar
-        foreach (['OBSSTOCKS_CRON_TOKEN', 'OBSSTOCKS_ALERT_EMAIL'] as $k) {
+        foreach (['OBSSTOCKS_CRON_TOKEN', 'OBSSTOCKS_ALERT_EMAIL', 'OBSSTOCKS_UPD_TS', 'OBSSTOCKS_UPD_INFO'] as $k) {
             Configuration::deleteByName($k);
         }
         self::removeLegacyTab();
@@ -104,13 +109,62 @@ class obsstocks extends Module
     }
 
     /* ==================================================================
+     * Actualizaciones
+     * ================================================================== */
+
+    public function getUpdater()
+    {
+        return new ObsstocksUpdater($this);
+    }
+
+    /** Aviso periódico al servidor de actualizaciones (solo en el back-office) */
+    public function hookActionAdminControllerSetMedia($params)
+    {
+        $this->getUpdater()->maybePing();
+    }
+
+    /** PS 8.1+: la versión nueva aparece en Gestor de módulos > Actualizaciones */
+    public function hookActionListModules($params)
+    {
+        return $this->getUpdater()->getNativeModuleList();
+    }
+
+    /* ==================================================================
      * Utilidades
      * ================================================================== */
 
-    public function adminUrl($extra = '')
+    /** Pestaña de la configuración que se está viendo */
+    private $obsTab = 'resumen';
+
+    private function tabs()
     {
+        return [
+            'resumen' => ['icon-dashboard', $this->l('Resumen')],
+            'avisos' => ['icon-bell', $this->l('Avisos')],
+            'importar' => ['icon-upload', $this->l('Importar CSV')],
+            'emails' => ['icon-envelope', $this->l('Emails y cron')],
+            'registro' => ['icon-list', $this->l('Registro')],
+        ];
+    }
+
+    public function adminUrl($extra = '', $tab = null)
+    {
+        $tab = $tab === null ? $this->obsTab : $tab;
+
         return $this->context->link->getAdminLink('AdminModules', true)
-            . '&configure=' . $this->name . '&tab_module=' . $this->tab . '&module_name=' . $this->name . $extra;
+            . '&configure=' . $this->name . '&tab_module=' . $this->tab . '&module_name=' . $this->name
+            . ($tab !== '' ? '&obs_tab=' . $tab : '') . $extra;
+    }
+
+    private function json(array $data)
+    {
+        while (ob_get_level()) {
+            @ob_end_clean();
+        }
+        header('Content-Type: application/json; charset=utf-8');
+        header('Cache-Control: private, no-store');
+        echo json_encode($data);
+        exit;
     }
 
     public function cronUrl($controller)
@@ -214,11 +268,33 @@ class obsstocks extends Module
 
     public function getContent()
     {
-        $out = '';
+        // Edición a mano de avisos (pestaña «Avisos»)
+        if (Tools::getValue('obs_ajax')) {
+            $this->ajaxAlerts((string) Tools::getValue('obs_ajax'));
+        }
+
+        $updater = $this->getUpdater();
+        $out = $updater->processRequest();
+
+        $tab = (string) Tools::getValue('obs_tab');
+        $this->obsTab = isset($this->tabs()[$tab]) ? $tab : 'resumen';
 
         // Descargas
         $exp = Tools::getValue('obs_export');
-        if ($exp) {
+        if ($exp === 'backup') {
+            $name = basename((string) Tools::getValue('f'));
+            if (in_array($name, Mystocks::backups(), true)) {
+                if (ob_get_level()) {
+                    @ob_end_clean();
+                }
+                header('Content-Type: text/csv; charset=utf-8');
+                header('Content-Disposition: attachment; filename="' . $name . '"');
+                header('Cache-Control: private, no-store');
+                readfile(Mystocks::backupDir() . $name);
+                exit;
+            }
+            $out .= $this->displayError($this->l('Esa copia de avisos ya no existe.'));
+        } elseif ($exp) {
             $d = date('YmdHis');
             switch ($exp) {
                 case 'combined':
@@ -238,6 +314,12 @@ class obsstocks extends Module
             }
         }
 
+        if (Tools::isSubmit('submitObsSettings') || Tools::isSubmit('obsRegenToken') || Tools::isSubmit('obsSendMin') || Tools::isSubmit('obsSendAll')) {
+            $this->obsTab = 'emails';
+        }
+        if (Tools::isSubmit('obsCheck') || Tools::isSubmit('obsImportNow') || Tools::isSubmit('obsConfirm')) {
+            $this->obsTab = 'importar';
+        }
         if (Tools::isSubmit('submitObsSettings')) {
             $emails = array_filter(array_map('trim', preg_split('/[,;\s]+/', (string) Tools::getValue('OBSSTOCKS_ALERT_EMAIL'))));
             $bad = array_filter($emails, function ($m) {
@@ -270,11 +352,11 @@ class obsstocks extends Module
                 $out .= $this->displayError($this->l('El archivo tiene que ser .csv. En Excel: Archivo > Guardar como > «CSV (delimitado por comas)».'));
             } else {
                 $dry = Tools::isSubmit('obsCheck');
-                $imp = new ObsStocksImporter(Tools::getValue('update_stock'), Tools::getValue('update_alerts'), Tools::getValue('add_stock'), $dry);
+                $imp = new ObsStocksImporter(Tools::getValue('update_stock'), Tools::getValue('update_alerts'), Tools::getValue('add_stock'), $dry, Tools::getValue('alerts_mode'));
                 $report = $imp->run($f['tmp_name']);
                 $report['file'] = $f['name'];
                 $report['dry'] = $dry;
-                if ($dry && !$report['error'] && ($report['stock_changed'] || $report['alert_changed'])) {
+                if ($dry && !$report['error'] && ($report['stock_changed'] || $report['alert_changed'] || $report['alert_deleted'])) {
                     $pending = Tools::passwdGen(32, 'ALPHANUMERIC');
                     move_uploaded_file($f['tmp_name'], $this->tmpDir() . $pending . '.csv');
                     @file_put_contents($this->tmpDir() . $pending . '.name', $f['name']);
@@ -289,7 +371,7 @@ class obsstocks extends Module
             if ($pid === '' || !is_file($path)) {
                 $out .= $this->displayError($this->l('El archivo comprobado ya no está disponible. Vuelve a subirlo.'));
             } else {
-                $imp = new ObsStocksImporter(Tools::getValue('update_stock'), Tools::getValue('update_alerts'), Tools::getValue('add_stock'), false);
+                $imp = new ObsStocksImporter(Tools::getValue('update_stock'), Tools::getValue('update_alerts'), Tools::getValue('add_stock'), false, Tools::getValue('alerts_mode'));
                 $report = $imp->run($path);
                 $report['file'] = is_file($this->tmpDir() . $pid . '.name') ? Tools::file_get_contents($this->tmpDir() . $pid . '.name') : 'archivo';
                 $report['dry'] = false;
@@ -299,28 +381,187 @@ class obsstocks extends Module
             }
         }
 
-        if ($report) {
-            $out .= $this->renderReport($report, $pending);
+        switch ($this->obsTab) {
+            case 'avisos':
+                $body = $this->renderAlertsEditor();
+                break;
+            case 'importar':
+                $body = ($report ? $this->renderReport($report, $pending) : '') . $this->renderHowTo() . $this->renderImportForm();
+                break;
+            case 'emails':
+                $body = $this->renderCronForm();
+                break;
+            case 'registro':
+                $body = $this->renderLog() . $this->renderBackups();
+                break;
+            default:
+                $body = $this->renderSummary() . $this->renderBelowMinimum();
         }
 
-        return $out
-            . $this->renderSummary()
-            . $this->renderHowTo()
-            . $this->renderImportForm()
-            . $this->renderBelowMinimum()
-            . $this->renderCronForm()
-            . $this->renderLog();
+        $info = $updater->getInfo();
+        $panel = $updater->renderPanel();
+        $newVersion = !empty($info['update_available']);
+
+        return '<link rel="stylesheet" href="' . $this->e($this->_path . 'views/css/admin.css?v=' . $this->version) . '" type="text/css">'
+            . $out
+            . ($newVersion ? $panel : '')
+            . $this->renderTabs()
+            . $body
+            . (!$newVersion && $this->obsTab === 'resumen' ? $panel : '');
+    }
+
+    private function renderTabs()
+    {
+        $html = '<ul class="nav nav-tabs obs-tabs">';
+        foreach ($this->tabs() as $key => $t) {
+            $html .= '<li' . ($key === $this->obsTab ? ' class="active"' : '') . '><a href="' . $this->e($this->adminUrl('', $key)) . '"><i class="' . $t[0] . '"></i> ' . $t[1] . '</a></li>';
+        }
+
+        return $html . '</ul>';
     }
 
     private function logImport(array $r)
     {
         $this->log(sprintf(
-            'Importado "%s": %d filas, %d stocks cambiados, %d avisos cambiados, %d no encontrados, %d con errores (%s%s%s)',
-            $r['file'], $r['rows'], $r['stock_changed'], $r['alert_changed'], $r['not_found'], $r['invalid'],
+            'Importado "%s": %d filas, %d stocks cambiados, %d avisos cambiados, %d avisos borrados, %d no encontrados, %d con errores (%s%s%s%s)',
+            $r['file'], $r['rows'], $r['stock_changed'], $r['alert_changed'], $r['alert_deleted'], $r['not_found'], $r['invalid'],
             Tools::getValue('update_stock') ? 'stock' : 'sin stock',
             Tools::getValue('update_alerts') ? ', avisos' : ', sin avisos',
-            Tools::getValue('add_stock') ? ', sumando' : ''
+            Tools::getValue('add_stock') ? ', sumando' : '',
+            !empty($r['replace']) ? ', avisos en modo SUSTITUIR' . (!empty($r['backup']) ? ', copia ' . $r['backup'] : '') : ''
         ) . ($r['error'] ? ' ERROR: ' . $r['error'] : ''));
+    }
+
+    /* ------------------------------------------------------------------
+     * Pestaña «Avisos»: buscar y editar a mano
+     * ------------------------------------------------------------------ */
+
+    private function ajaxAlerts($action)
+    {
+        $ref = trim((string) Tools::getValue('reference'));
+        if ($ref === '' || Tools::strlen($ref) > 64) {
+            $this->json(['ok' => false, 'error' => $this->l('Referencia no válida.')]);
+        }
+        $alerts = Mystocks::alerts();
+        $cur = isset($alerts[$ref]) ? $alerts[$ref] : null;
+
+        if ($action === 'delete') {
+            if ($cur) {
+                Mystocks::deleteAlert($ref);
+                $this->log(sprintf('Aviso quitado a mano: %s (tenía mínimo %d, a pedir %d)', $ref, $cur['min_stock'], $cur['qty']));
+            }
+            $this->json(['ok' => true, 'exists' => false]);
+        }
+        if ($action !== 'save') {
+            $this->json(['ok' => false, 'error' => $this->l('Acción no válida.')]);
+        }
+
+        $min = Tools::getValue('min_stock');
+        $qty = Tools::getValue('qty');
+        if (!preg_match('/^[0-9]{1,9}$/', (string) $min) || !preg_match('/^[0-9]{1,9}$/', (string) $qty)) {
+            $this->json(['ok' => false, 'error' => $this->l('Tienen que ser números enteros, sin negativos.')]);
+        }
+        $min = (int) $min;
+        $qty = (int) $qty;
+        // Sin aviso previo y con 0/0 no hay nada que guardar
+        if (!$cur && $min === 0 && $qty === 0) {
+            $this->json(['ok' => true, 'exists' => false]);
+        }
+        if (!$cur || $cur['min_stock'] !== $min || $cur['qty'] !== $qty) {
+            if (!Mystocks::saveAlert($ref, $min, $qty)) {
+                $this->json(['ok' => false, 'error' => $this->l('No se ha podido guardar.')]);
+            }
+            $this->log(sprintf('Aviso editado a mano: %s, mínimo %s → %d, a pedir %s → %d', $ref, $cur ? $cur['min_stock'] : '—', $min, $cur ? $cur['qty'] : '—', $qty));
+        }
+        $this->json(['ok' => true, 'exists' => true, 'min_stock' => $min, 'qty' => $qty]);
+    }
+
+    private function renderAlertsEditor()
+    {
+        $alerts = Mystocks::alerts();
+        $rows = [];
+        $used = [];
+        foreach (Mystocks::catalog(false) as $r) {
+            $ref = trim((string) $r['reference']);
+            $a = ($ref !== '' && isset($alerts[$ref])) ? $alerts[$ref] : null;
+            if ($ref !== '') {
+                $used[$ref] = true;
+            }
+            $rows[] = [$ref, (string) $r['name'], (int) $r['stock'], $a ? (int) $a['min_stock'] : null, $a ? (int) $a['qty'] : null, (int) $r['active'], 0];
+        }
+        // Avisos de referencias que ya no están en ningún producto: se pueden ver y quitar
+        foreach ($alerts as $ref => $a) {
+            if (!isset($used[$ref])) {
+                $rows[] = [(string) $ref, '', null, (int) $a['min_stock'], (int) $a['qty'], 0, 1];
+            }
+        }
+
+        $config = [
+            'url' => $this->adminUrl('', 'avisos'),
+            'rows' => $rows,
+            't' => [
+                'showing' => $this->l('Mostrando %1 de %2'),
+                'none' => $this->l('No hay ningún producto que coincida.'),
+                'inactive' => $this->l('inactivo'),
+                'orphan' => $this->l('Esta referencia ya no está en ningún producto'),
+                'noref' => $this->l('sin referencia'),
+                'remove' => $this->l('Quitar'),
+                'removeTitle' => $this->l('Quitar el aviso de esta referencia'),
+                'confirmRemove' => $this->l('¿Quitar el aviso de la referencia %1?'),
+                'saving' => $this->l('Guardando…'),
+                'saved' => $this->l('Guardado'),
+                'removed' => $this->l('Aviso quitado'),
+                'invalid' => $this->l('Número no válido'),
+                'failed' => $this->l('No se ha podido guardar. Recarga la página y vuelve a intentarlo.'),
+            ],
+        ];
+        $flags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT;
+        if (defined('JSON_INVALID_UTF8_SUBSTITUTE')) {
+            $flags |= JSON_INVALID_UTF8_SUBSTITUTE;
+        }
+        $filter = function ($key, $label) {
+            return '<button type="button" class="btn btn-default" data-obs-filter="' . $key . '">' . $label . ' <span class="badge">0</span></button>';
+        };
+
+        return '<div class="panel" id="obs_avisos">'
+            . '<div class="panel-heading"><i class="icon-bell"></i> ' . $this->l('Avisos: buscar y editar a mano') . '</div>'
+            . '<p class="help-block">' . $this->l('Escribe parte de la referencia o del nombre. Cambia el stock mínimo o la cantidad a pedir y se guarda solo al salir de la casilla (o con Intro). Aquí no se cambia el stock real. El aviso va por referencia: si dos productos comparten referencia, comparten aviso.') . '</p>'
+            . '<div class="obs-av-bar">'
+            . '<input type="text" class="form-control obs-av-search" placeholder="' . $this->l('Buscar por referencia o nombre…') . '" autocomplete="off">'
+            . '<div class="btn-group">'
+            . $filter('alert', $this->l('Con aviso'))
+            . $filter('below', $this->l('Bajo mínimo'))
+            . $filter('all', $this->l('Todos los productos'))
+            . $filter('orphan', $this->l('Sin producto'))
+            . '</div>'
+            . '<span class="obs-av-info text-muted"></span>'
+            . '</div>'
+            . '<div class="table-responsive"><table class="table table-condensed obs-av-table"><thead><tr>'
+            . '<th>' . $this->l('Referencia') . '</th><th>' . $this->l('Producto') . '</th><th class="text-center">' . $this->l('Stock') . '</th>'
+            . '<th class="text-center">' . $this->l('Stock mínimo') . '</th><th class="text-center">' . $this->l('A pedir') . '</th><th></th>'
+            . '</tr></thead><tbody></tbody></table></div>'
+            . '<div class="obs-av-more" style="display:none"><button type="button" class="btn btn-default">' . $this->l('Mostrar más') . '</button></div>'
+            . '</div>'
+            . '<script>var obsAvisos = ' . json_encode($config, $flags) . ';</script>'
+            . '<script src="' . $this->e($this->_path . 'views/js/avisos.js?v=' . $this->version) . '"></script>';
+    }
+
+    private function renderBackups()
+    {
+        $files = Mystocks::backups();
+        $html = '<div class="panel"><div class="panel-heading"><i class="icon-archive"></i> ' . $this->l('Copias de los avisos') . '</div>'
+            . '<p class="help-block">' . $this->l('Cada vez que se importa en modo «sustituir» y se borra algún aviso, antes se guarda aquí una copia de todos. Para recuperarla, descárgala y súbela en «Importar CSV». Se conservan las 15 últimas.') . '</p>';
+        if (!$files) {
+            return $html . '<p class="text-muted">' . $this->l('Todavía no hay ninguna copia.') . '</p></div>';
+        }
+        $html .= '<table class="table table-condensed"><tbody>';
+        foreach ($files as $f) {
+            $when = preg_match('/^avisos-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/', $f, $m) ? $m[3] . '/' . $m[2] . '/' . $m[1] . ' ' . $m[4] . ':' . $m[5] : '';
+            $html .= '<tr><td>' . $this->e($when) . '</td><td><code>' . $this->e($f) . '</code></td><td class="text-right"><a class="btn btn-default btn-sm" href="'
+                . $this->e($this->adminUrl('&obs_export=backup&f=' . rawurlencode($f))) . '"><i class="icon-download"></i> ' . $this->l('Descargar') . '</a></td></tr>';
+        }
+
+        return $html . '</tbody></table></div>';
     }
 
     /* ------------------------------------------------------------------ */
@@ -396,7 +637,7 @@ class obsstocks extends Module
         $h->allow_employee_form_lang = (int) Configuration::get('PS_BO_ALLOW_EMPLOYEE_FORM_LANG');
         $h->submit_action = '';
         $h->currentIndex = $this->context->link->getAdminLink('AdminModules', false)
-            . '&configure=' . $this->name . '&tab_module=' . $this->tab . '&module_name=' . $this->name;
+            . '&configure=' . $this->name . '&tab_module=' . $this->tab . '&module_name=' . $this->name . '&obs_tab=' . $this->obsTab;
         $h->token = Tools::getAdminTokenLite('AdminModules');
         $h->tpl_vars = ['languages' => $this->context->controller->getLanguages(), 'id_language' => (int) $this->context->language->id];
 
@@ -421,6 +662,14 @@ class obsstocks extends Module
                 $this->yesNo('update_stock', $this->l('Actualizar stock real'), $this->l('Usa la columna CURRENT STOCK.')),
                 $this->yesNo('update_alerts', $this->l('Actualizar avisos'), $this->l('Usa las columnas MIN STOCK (o MIN ALERT STOCK) y QTY.')),
                 [
+                    'type' => 'radio', 'label' => $this->l('Los avisos que no vienen en el archivo'), 'name' => 'alerts_mode',
+                    'desc' => $this->l('En modo «sustituir» los avisos quedan exactamente como el archivo. Úsalo solo con un archivo completo de avisos: «Comprobar archivo» te dice antes cuántos se van a borrar, y se guarda una copia (pestaña Registro).'),
+                    'values' => [
+                        ['id' => 'alerts_mode_0', 'value' => 0, 'label' => $this->l('Se mantienen como están (solo se cambian las referencias del archivo)')],
+                        ['id' => 'alerts_mode_1', 'value' => 1, 'label' => $this->l('Se borran (sustituir todos los avisos por los del archivo)')],
+                    ],
+                ],
+                [
                     'type' => 'radio', 'label' => $this->l('El stock del archivo'), 'name' => 'add_stock',
                     'values' => [
                         ['id' => 'add_stock_0', 'value' => 0, 'label' => $this->l('Sustituye al actual (inventario: el producto queda con ese stock)')],
@@ -441,6 +690,7 @@ class obsstocks extends Module
             'update_stock' => (int) Tools::getValue('update_stock', 1),
             'update_alerts' => (int) Tools::getValue('update_alerts', 1),
             'add_stock' => (int) Tools::getValue('add_stock', 0),
+            'alerts_mode' => (int) Tools::getValue('alerts_mode', 0),
         ];
 
         return $h->generateForm([$form]);
@@ -476,6 +726,7 @@ class obsstocks extends Module
             . ($r['dry'] ? $this->l('Se cambiaría:') : $this->l('Cambiado:')) . ' <strong>' . sprintf($this->l('%d stocks'), $r['stock_changed']) . '</strong>, <strong>'
             . sprintf($this->l('%d avisos'), $r['alert_changed']) . '</strong>. '
             . sprintf($this->l('%d sin cambios.'), $r['unchanged'])
+            . (!empty($r['replace']) ? ' ' . ($r['dry'] ? $this->l('Avisos que se borrarían:') : $this->l('Avisos borrados:')) . ' <strong>' . (int) $r['alert_deleted'] . '</strong>.' : '')
             . '<br><small>' . $this->l('Columnas reconocidas:') . ' ' . implode(' · ', $cols) . '</small></div>';
         if ($r['not_found'] || $r['invalid']) {
             $html .= '<div class="alert alert-warning">' . sprintf($this->l('%d filas con referencia no encontrada y %d filas con valores no válidos: no se han tocado. Las tienes en rojo/naranja en la tabla.'), $r['not_found'], $r['invalid']) . '</div>';
@@ -483,7 +734,18 @@ class obsstocks extends Module
         if ($ignored) {
             $html .= '<div class="alert alert-warning">' . $this->l('Atención:') . ' ' . implode('; ', $ignored) . '.</div>';
         }
-        if ($r['dry'] && !$r['stock_changed'] && !$r['alert_changed']) {
+        if (Tools::getValue('alerts_mode') && empty($r['replace'])) {
+            $html .= '<div class="alert alert-warning">' . $this->l('Has elegido sustituir los avisos, pero no se aplica: el archivo no trae columnas de avisos o «Actualizar avisos» está desactivado. No se borra ningún aviso.') . '</div>';
+        }
+        if (!empty($r['alert_deleted'])) {
+            $html .= '<div class="alert alert-danger"><strong>' . $this->l('Modo sustituir.') . '</strong> '
+                . ($r['dry']
+                    ? sprintf($this->l('Al confirmar se BORRARÁN %d avisos de referencias que no vienen en este archivo. Los tienes en la tabla, marcados «Se borrará». Antes de borrar se guarda una copia de todos los avisos.'), $r['alert_deleted'])
+                    : sprintf($this->l('Se han borrado %d avisos de referencias que no venían en el archivo.'), $r['alert_deleted'])
+                        . ' ' . (!empty($r['backup']) ? sprintf($this->l('Copia de los avisos anteriores: %s (pestaña Registro).'), $this->e($r['backup'])) : $this->l('No se ha podido guardar la copia de los avisos anteriores (permisos de la carpeta logs del módulo).')))
+                . '</div>';
+        }
+        if ($r['dry'] && !$r['stock_changed'] && !$r['alert_changed'] && empty($r['alert_deleted'])) {
             $html .= '<div class="alert alert-warning">' . $this->l('No hay nada que cambiar con este archivo y estas opciones.') . '</div>';
         }
 
@@ -494,15 +756,17 @@ class obsstocks extends Module
                 . '<input type="hidden" name="update_stock" value="' . (int) Tools::getValue('update_stock') . '">'
                 . '<input type="hidden" name="update_alerts" value="' . (int) Tools::getValue('update_alerts') . '">'
                 . '<input type="hidden" name="add_stock" value="' . (int) Tools::getValue('add_stock') . '">'
+                . '<input type="hidden" name="alerts_mode" value="' . (int) Tools::getValue('alerts_mode') . '">'
                 . '<button type="submit" name="obsConfirm" id="obs_confirm" class="btn btn-success btn-lg"><i class="icon-check"></i> ' . $this->l('Confirmar e importar') . '</button> '
                 . '<a href="' . $this->e($h) . '" class="btn btn-default btn-lg">' . $this->l('Cancelar') . '</a>'
                 . ' <span class="help-block" style="display:inline-block;margin-left:10px">'
-                . (Tools::getValue('add_stock') ? $this->l('Modo: se SUMA el stock del archivo al actual.') : $this->l('Modo: el stock del archivo SUSTITUYE al actual.')) . '</span>'
+                . (Tools::getValue('add_stock') ? $this->l('Modo: se SUMA el stock del archivo al actual.') : $this->l('Modo: el stock del archivo SUSTITUYE al actual.'))
+                . (!empty($r['replace']) ? ' ' . $this->l('Avisos: se SUSTITUYEN todos por los del archivo.') : '') . '</span>'
                 . '</form>';
         }
 
         // Primero las filas con problemas, luego las que cambian; sin cambios al final
-        $order = ['invalid' => 0, 'not_found' => 1, 'partial' => 2, 'changed' => 3, 'unchanged' => 4];
+        $order = ['invalid' => 0, 'not_found' => 1, 'partial' => 2, 'deleted' => 3, 'changed' => 4, 'unchanged' => 5];
         $lines = $r['lines'];
         usort($lines, function ($a, $b) use ($order) {
             return $order[$a['status']] == $order[$b['status']] ? $a['line'] - $b['line'] : $order[$a['status']] - $order[$b['status']];
@@ -511,6 +775,7 @@ class obsstocks extends Module
             'invalid' => ['danger', $this->l('Valor no válido')],
             'not_found' => ['danger', $this->l('No encontrado')],
             'partial' => ['warning', $this->l('En parte')],
+            'deleted' => ['danger', $r['dry'] ? $this->l('Se borrará') : $this->l('Borrado')],
             'changed' => ['success', $r['dry'] ? $this->l('Cambiará') : $this->l('Cambiado')],
             'unchanged' => ['default', $this->l('Sin cambios')],
         ];
@@ -519,7 +784,7 @@ class obsstocks extends Module
             . $this->l('Resultado') . '</th><th>' . $this->l('Detalle') . '</th></tr></thead><tbody>';
         foreach (array_slice($lines, 0, $max) as $l) {
             $s = $st[$l['status']];
-            $html .= '<tr' . ($s[0] == 'danger' ? ' class="danger"' : ($s[0] == 'warning' ? ' class="warning"' : '')) . '><td>' . (int) $l['line'] . '</td><td style="white-space:nowrap"><code>' . $this->e($l['reference']) . '</code></td>'
+            $html .= '<tr' . ($s[0] == 'danger' ? ' class="danger"' : ($s[0] == 'warning' ? ' class="warning"' : '')) . '><td>' . ((int) $l['line'] ?: '—') . '</td><td style="white-space:nowrap"><code>' . $this->e($l['reference']) . '</code></td>'
                 . '<td><span class="label label-' . $s[0] . '">' . $s[1] . '</span></td><td>' . $this->e($l['text']) . '</td></tr>';
         }
         $html .= '</tbody></table></div>';
