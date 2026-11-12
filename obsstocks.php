@@ -20,7 +20,7 @@ class obsstocks extends Module
     {
         $this->name = 'obsstocks';
         $this->tab = 'migration_tools';
-        $this->version = '2.1.2';
+        $this->version = '2.1.3';
         $this->author = 'OBSolutions.es';
         $this->need_instance = 0;
         $this->bootstrap = true;

@@ -425,8 +425,10 @@ class ObsstocksUpdater
         if ($this->module->disable()) {
             $this->module->active = 0;
             $this->setParked(true);
+            // Aviso en la página donde ocurre, salvo en la configuración del propio módulo (allí sale el cartel con el botón)
             $controller = Context::getContext()->controller;
-            if ($controller && property_exists($controller, 'warnings') && is_array($controller->warnings)) {
+            if (Tools::getValue('configure') !== $this->module->name
+                && $controller && property_exists($controller, 'warnings') && is_array($controller->warnings)) {
                 $controller->warnings[] = $this->noticeText();
             }
         }
@@ -526,11 +528,11 @@ class ObsstocksUpdater
         return $this->ready();
     }
 
-    /** Texto para el error de PrestaShop cuando se intenta activar sin alta */
+    /** Aviso corto cuando el módulo se desactiva (o no se deja activar) por falta de licencia */
     public function noticeText()
     {
         return sprintf(
-            '%s necesita licencia para esta tienda (%s). Pide la licencia a Josra indicando este dominio y, cuando te confirme que ya la tienes, vuelve a pulsar «Activar».',
+            '%1$s se ha desactivado porque esta tienda (%2$s) no tiene licencia. Pide la licencia a Josra indicando este dominio. Cuando la tengas, entra en Módulos > %1$s > Configurar y pulsa «Ya tengo la licencia: activar el módulo».',
             $this->module->displayName,
             rtrim($this->site(), '/')
         );
@@ -580,6 +582,10 @@ class ObsstocksUpdater
 
         // Autorreparación: hooks del actualizador (por si el módulo se subió por FTP)
         $this->registerHooks();
+
+        // Licencia al día antes de pintar nada: PrestaShop pinta la configuración antes que los hooks
+        // del back-office, y sin esto el cartel no saldría la primera vez (nada más instalar)
+        $this->maybePing();
 
         // Botón del cartel: comprobar el alta y activar el módulo
         if (Tools::isSubmit('josraupd_on')) {

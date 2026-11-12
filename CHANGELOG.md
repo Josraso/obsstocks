@@ -1,5 +1,8 @@
 # Changelog - obsstocks
 
+## 2.1.3
+- Licencia: el cartel con el botón «Ya tengo la licencia» sale desde la primera vez que se abre la configuración, y el aviso del back-office explica dónde pulsar.
+
 ## 2.1.2
 - La licencia la decide el panel del servidor de actualizaciones: si se exige y la tienda no la tiene, el módulo se desactiva solo; al tenerla, o al dejar de exigirse, vuelve a activarse.
 
