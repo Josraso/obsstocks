@@ -13,6 +13,10 @@
  *   y al abrir el gestor se vuelve a preguntar al servidor (como mucho cada 5 minutos).
  * - Avisa al servidor cuando el módulo se desinstala y del resultado de cada
  *   actualización hecha desde la configuración del módulo.
+ * - Licencia decidida desde el panel del servidor ("Exigir licencia"): si el
+ *   panel la exige y esta tienda no la tiene, el módulo se desactiva solo (y
+ *   PrestaShop deja de ejecutarlo); cuando la tiene, o el panel deja de
+ *   exigirla, se vuelve a activar. Si el servidor no contesta, sigue como estaba.
  *
  * Para usarlo en otro módulo:
  * 1. Copia este archivo a classes/ y cambia el nombre de la clase
@@ -43,9 +47,6 @@ class ObsstocksUpdater
     /** Clave de este módulo en el servidor de actualizaciones: solo vale para él (ficha del módulo en el panel) */
     const API_KEY = '9e041f6403d57818125e48ad9c2d2e69f3a813c6';
 
-    /** 0 = normal · 1 = requiere alta en el servidor para esta tienda */
-    const CHANNEL = 0;
-
     /** Segundos entre avisos automáticos (6 horas) */
     const CHECK_EVERY = 21600;
 
@@ -54,6 +55,12 @@ class ObsstocksUpdater
 
     /** Si el servidor no contesta, las comprobaciones del gestor de módulos esperan estos segundos (todos los módulos) */
     const RETRY_AFTER_FAIL = 600;
+
+    /** Cada cuánto se revisan los módulos desactivados por falta de licencia, por si ya la tienen (todos los módulos) */
+    const PARKED_EVERY = 1800;
+
+    /** Antes de desactivar por falta de licencia, se vuelve a preguntar si la última respuesta tiene más de estos segundos */
+    const RECHECK_BEFORE_PARK = 300;
 
     /** @var Module */
     protected $module;
@@ -135,7 +142,8 @@ class ObsstocksUpdater
     /* ------------------------------------------------------------------ */
 
     /**
-     * Aviso periódico desde el back-office (cada CHECK_EVERY segundos). Nunca lanza errores.
+     * Desde el back-office, en cada página: aviso periódico al servidor (cada CHECK_EVERY
+     * segundos), licencia y revisión de los módulos desactivados por licencia. Nunca lanza errores.
      */
     public function maybePing()
     {
@@ -145,12 +153,15 @@ class ObsstocksUpdater
 
         try {
             $last = (int) Configuration::getGlobalValue($this->key . '_TS');
-            if ($last > time() - self::CHECK_EVERY) {
-                return;
+            if ($last <= time() - self::CHECK_EVERY) {
+                // Se marca antes de llamar: si el servidor no responde, no se reintenta en cada página
+                Configuration::updateGlobalValue($this->key . '_TS', time());
+                $this->check(4);
             }
-            // Se marca antes de llamar: si el servidor no responde, no se reintenta en cada página
-            Configuration::updateGlobalValue($this->key . '_TS', time());
-            $this->check(4);
+            $this->enforce();
+            if ($this->module->active) {
+                $this->processParked();
+            }
         } catch (Exception $e) {
             // El back-office nunca debe fallar por esto
         } catch (Throwable $e) {
@@ -217,6 +228,8 @@ class ObsstocksUpdater
             'notice' => isset($response['notice']) ? (string) $response['notice'] : '',
             'checked_at' => time(),
             'for_version' => $this->module->version,
+            // ¿El panel exige licencia para este módulo? (lo decide el servidor en cada respuesta)
+            'lr' => isset($response['license']) && is_array($response['license']) && !empty($response['license']['required']) ? 1 : 0,
         );
         // En base64 para que Configuration no toque el contenido
         Configuration::updateGlobalValue($this->key . '_INFO', base64_encode(json_encode($info)));
@@ -353,10 +366,18 @@ class ObsstocksUpdater
         return Tools::substr(hash_hmac('sha256', 'josra-licencia|' . Tools::strtolower($this->module->name) . '|' . $site . '|' . (int) $exp, self::API_KEY), 0, 48);
     }
 
+    /** ¿Exige el panel licencia para este módulo? (según la última respuesta del servidor; sin respuesta, no) */
+    public function licenseRequired()
+    {
+        $info = $this->getInfo();
+
+        return !empty($info['lr']);
+    }
+
     /** ¿Está el módulo habilitado para esta tienda? */
     public function ready()
     {
-        if (self::CHANNEL == 0 || $this->localHost()) {
+        if (!$this->licenseRequired() || $this->localHost()) {
             return true;
         }
         $g = $this->grant();
@@ -373,13 +394,123 @@ class ObsstocksUpdater
         if (!$this->ready()) {
             return false;
         }
-        if (self::CHANNEL == 0 || $this->localHost()) {
+        if (!$this->licenseRequired() || $this->localHost()) {
             return true;
         }
         $g = $this->grant();
         $e = isset($g['e']) ? (int) $g['e'] : 0;
 
         return $e === 0 || time() < $e;
+    }
+
+    /**
+     * Si el panel exige licencia y esta tienda no la tiene, desactiva el módulo: así PrestaShop
+     * no ejecuta nada suyo (hooks, controladores, crons por URL). Antes de desactivar, si la
+     * última respuesta es antigua, vuelve a preguntar (puede que ya tenga licencia o que se
+     * haya dejado de exigir).
+     */
+    public function enforce()
+    {
+        if (!$this->module->active || $this->ready()) {
+            return;
+        }
+        $info = $this->getInfo();
+        if (empty($info['checked_at']) || (int) $info['checked_at'] < time() - self::RECHECK_BEFORE_PARK) {
+            Configuration::updateGlobalValue($this->key . '_TS', time());
+            if (!is_array($this->check(4)) || $this->ready()) {
+                // Sin respuesta del servidor no se desactiva nada
+                return;
+            }
+        }
+        if ($this->module->disable()) {
+            $this->module->active = 0;
+            $this->setParked(true);
+            $controller = Context::getContext()->controller;
+            if ($controller && property_exists($controller, 'warnings') && is_array($controller->warnings)) {
+                $controller->warnings[] = $this->noticeText();
+            }
+        }
+    }
+
+    /** Lista común (de todos los módulos de josra) de módulos desactivados por falta de licencia */
+    protected function parkedList()
+    {
+        $list = json_decode((string) Configuration::getGlobalValue('JOSRAUPD_PARKED'), true);
+
+        return is_array($list) ? array_values(array_unique(array_filter($list, 'is_string'))) : array();
+    }
+
+    protected function setParked($on)
+    {
+        $list = array_diff($this->parkedList(), array($this->module->name));
+        if ($on) {
+            $list[] = $this->module->name;
+        }
+        Configuration::updateGlobalValue('JOSRAUPD_PARKED', json_encode(array_values($list)));
+    }
+
+    public function isParked()
+    {
+        return in_array($this->module->name, $this->parkedList(), true);
+    }
+
+    /**
+     * Para la revisión de otro módulo: si ya puede funcionar (tiene licencia o ya no se exige),
+     * lo vuelve a activar. Devuelve true si ya no hay que seguir revisándolo.
+     */
+    public function unpark()
+    {
+        if ($this->module->active) {
+            $this->setParked(false);
+
+            return true;
+        }
+        if (!is_array($this->check(3)) || !$this->ready()) {
+            return false;
+        }
+        if ($this->module->enable()) {
+            $this->module->active = 1;
+            $this->setParked(false);
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Un módulo desactivado no ejecuta sus hooks y no puede reactivarse solo: lo revisan los
+     * demás módulos de josra que sigan activos, como mucho cada PARKED_EVERY segundos.
+     */
+    protected function processParked()
+    {
+        $list = $this->parkedList();
+        if (!$list || (int) Configuration::getGlobalValue('JOSRAUPD_PARKED_TS') > time() - self::PARKED_EVERY) {
+            return;
+        }
+        Configuration::updateGlobalValue('JOSRAUPD_PARKED_TS', time());
+        foreach ($list as $name) {
+            if (!Validate::isModuleName($name) || !Module::isInstalled($name)) {
+                $this->dropParked($name);
+                continue;
+            }
+            $other = Module::getInstanceByName($name);
+            if (!$other || !method_exists($other, 'getUpdater')) {
+                $this->dropParked($name);
+                continue;
+            }
+            $updater = $other->getUpdater();
+            if (!method_exists($updater, 'unpark')) {
+                $this->dropParked($name);
+                continue;
+            }
+            $updater->unpark();
+        }
+    }
+
+    protected function dropParked($name)
+    {
+        Configuration::updateGlobalValue('JOSRAUPD_PARKED', json_encode(array_values(array_diff($this->parkedList(), array($name)))));
     }
 
     /**
@@ -411,17 +542,14 @@ class ObsstocksUpdater
      */
     public function renderNotice()
     {
-        if (self::CHANNEL == 0) {
-            return '';
-        }
         $ready = $this->ready();
-        if ($ready && $this->module->active) {
+        if ($ready && ($this->module->active || !$this->isParked())) {
             return '';
         }
         $name = Tools::safeOutput($this->module->displayName);
         if ($ready) {
             $title = $name . ' está desactivado';
-            $text = 'La licencia de esta tienda está bien, pero el módulo está desactivado. Pulsa el botón para activarlo.';
+            $text = 'Se desactivó porque no tenía licencia, pero ya puede funcionar en esta tienda. Pulsa el botón para activarlo.';
             $button = 'Activar el módulo';
         } else {
             $title = $name . ' necesita licencia para esta tienda';
@@ -457,6 +585,7 @@ class ObsstocksUpdater
         if (Tools::isSubmit('josraupd_on')) {
             if ($this->canEnable() && ($this->module->active || $this->module->enable())) {
                 $this->module->active = 1;
+                $this->setParked(false);
                 $html .= $this->module->displayConfirmation('Licencia comprobada: el módulo ya está activado.');
             } else {
                 $html .= $this->module->displayError('Todavía no consta la licencia para ' . rtrim($this->site(), '/') . '. Si te acaban de confirmar que la tienes, espera un minuto y vuelve a pulsar el botón.');
